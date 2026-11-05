@@ -24,6 +24,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Fetch the last published bundle (to catch a source that came back short)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out
+          gh release download --pattern advisories.json --output out/previous.json 2>/dev/null \
+            && echo "Previous bundle: $(python -c "import json; print(len(json.load(open('out/previous.json'))['advisories']))") advisories" \
+            || echo "No previous bundle"
       - name: Build and sign the bundle
         env:
           ADVISORY_SIGNING_KEY: ${{ secrets.ADVISORY_SIGNING_KEY }}
@@ -41,6 +49,7 @@ jobs:
             --extra ../curated/extra.json \
             --requires ../curated/requires.json \
             --key "$RUNNER_TEMP/signing.key" \
+            --previous ../out/previous.json \
             --out ../out/advisories.json --latest ../out/latest.json 2>&1 | tee ../out/build.log
           rc=${PIPESTATUS[0]}
           rm -f "$RUNNER_TEMP/signing.key"
@@ -61,7 +70,8 @@ jobs:
           print(f"\nSigned with key `{b.get('key_id')}`.")
           PY
           cat out/notes.md >> "$GITHUB_STEP_SUMMARY"
-          python -c "import json; [print('::warning::Source ' + s['source'] + ' failed: ' + s['error']) for s in json.load(open('out/advisories.json'))['sources'] if s.get('error')]"
+          python -c "import json,sys; bad=[s for s in json.load(open('out/advisories.json'))['sources'] if s.get('error')]; [print('::error::Source ' + s['source'] + ' failed: ' + s['error']) for s in bad]; sys.exit(1 if bad else 0)" \
+            || { echo "::error::A source failed: not publishing (the last complete bundle stays in use)"; exit 1; }
           python -c "import json,sys; b=json.load(open('out/advisories.json')); sys.exit(0 if len(b['advisories']) > 0 else 1)" \
             || { echo "::error::The bundle is empty: not publishing"; exit 1; }
       - name: Publish the release

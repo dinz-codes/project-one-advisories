@@ -335,7 +335,7 @@ USER_AGENT = ('Mozilla/5.0 (compatible; ProjectOneAdvisoryBuilder/1.0; '
               '+https://github.com/dinz-codes/project-one-advisories)')
 
 
-def _fetch(url: str, limit=200 * 1024 * 1024, tries=3) -> bytes:
+def _fetch(url: str, limit=200 * 1024 * 1024, tries=3, retry_403=False) -> bytes:
     """One https document, read to the end (large answers arrive in pieces); retried with a pause when the connection
     breaks or the server is busy. A document larger than ``limit`` is refused rather than cut."""
     import http.client
@@ -358,12 +358,12 @@ def _fetch(url: str, limit=200 * 1024 * 1024, tries=3) -> bytes:
                     parts.append(chunk)
                 return b''.join(parts)
         except urllib.error.HTTPError as exc:
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == tries - 1:
+            if exc.code not in (429, 500, 502, 503, 504) + ((403,) if retry_403 else ()) or attempt == tries - 1:
                 raise
         except (http.client.IncompleteRead, ConnectionError, TimeoutError, urllib.error.URLError):
             if attempt == tries - 1:
                 raise
-        time.sleep(5 * (attempt + 1))
+        time.sleep((15 if retry_403 else 5) * (attempt + 1))
     raise RuntimeError('unreachable')
 
 
@@ -398,20 +398,39 @@ def csaf_documents(source: str, since: str | None = None):
         yield from _fetch_many([urllib.parse.urljoin(base, n) for n in dict.fromkeys(names)])
 
 
-def _fetch_many(urls, workers=8):
-    """JSON documents fetched a few at a time; one bad document never stops the build."""
+MAX_FAILED_SHARE = 0.02          # a source missing more than 2% of its documents is a failed source, not a short one
+
+
+def _fetch_many(urls, workers=4):
+    """JSON documents fetched a few at a time (vendors throttle bursts). Failures are retried once, slowly, at the end;
+    if more than MAX_FAILED_SHARE still fail, the source fails as a whole so the bundle is never quietly incomplete."""
+    import time
     from concurrent.futures import ThreadPoolExecutor
+    urls = list(urls)
+    failed = []
 
     def one(u):
         try:
-            return json.loads(_fetch(u))
+            return json.loads(_fetch(u, retry_403=True))
         except Exception as exc:
-            log.warning('Skipping %s: %s', u, exc)
+            failed.append((u, str(exc)[:120]))
             return None
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for doc in pool.map(one, urls):
             if doc is not None:
                 yield doc
+    if failed:
+        log.warning('%d of %d documents failed; retrying them one at a time', len(failed), len(urls))
+        again, failed[:] = list(failed), []
+        for u, _ in again:
+            time.sleep(1)
+            doc = one(u)
+            if doc is not None:
+                yield doc
+    for u, why in failed[:10]:
+        log.warning('Not read: %s (%s)', u, why)
+    if urls and len(failed) > max(2, MAX_FAILED_SHARE * len(urls)):
+        raise RuntimeError(f'{len(failed)} of {len(urls)} documents could not be read (first: {failed[0][1]})')
 
 
 # ------------------------------------------------------------------ CVE JSON 5 records (Palo Alto Networks)
@@ -727,6 +746,16 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
     return bundle
 
 
+def shrinkage(new: dict, old: dict | None, *, floor=20, keep=0.8) -> list[str]:
+    """Operating systems whose advisory count fell below ``keep`` of the previous bundle's (when it had at least
+    ``floor``): a sign that a source was cut short. Vendors almost never withdraw advisories in bulk."""
+    if not old:
+        return []
+    count = lambda b: {k: sum(1 for a in b.get('advisories', []) if a.get('os') == k) for k in OS_NAMES}
+    n, o = count(new), count(old)
+    return [f'{k}: {n[k]} advisories, previously {o[k]}' for k in OS_NAMES if o[k] >= floor and n[k] < keep * o[k]]
+
+
 def sign_bundle(bundle: dict, secret: bytes) -> dict:
     b = dict(bundle, key_id=ed25519.public_key(secret).hex())
     b.pop('signature', None)
@@ -753,6 +782,7 @@ def main(argv=None):
     b.add_argument('--since', help='only CSAF documents changed on or after YYYY-MM-DD')
     b.add_argument('--paloalto', action='store_true', help="add Palo Alto Networks' PAN-OS advisories (their public API)")
     b.add_argument('--latest', help='also write the small latest.json (bundle id, date, sha256) the update service serves')
+    b.add_argument('--previous', help='the last published bundle: refuse to write a bundle that lost many advisories')
     b.add_argument('--key', help='signing key file (omit for an unsigned lab bundle)')
     b.add_argument('--out', required=True)
     i = sub.add_parser('import', help='check and install a bundle for this installation')
@@ -778,6 +808,12 @@ def main(argv=None):
         requires = json.loads(Path(a.requires).read_text(encoding='utf-8')) if a.requires else None
         logging.basicConfig(level=logging.INFO, format='%(message)s')
         bundle = build(a.csaf, extra, requires, a.since, paloalto=a.paloalto)
+        failed = [s for s in bundle['sources'] if s.get('error')]
+        if a.previous and Path(a.previous).exists():
+            lost = shrinkage(bundle, json.loads(Path(a.previous).read_text(encoding='utf-8')))
+            if lost:
+                raise SystemExit('Not publishing: advisories dropped sharply against the last bundle ('
+                                 + '; '.join(lost) + ')' + (f'; failed sources: {[s["source"] for s in failed]}' if failed else ''))
         if a.key:
             bundle = sign_bundle(bundle, _read_key(a.key))
         raw = json.dumps(bundle, separators=(',', ':')).encode('utf-8')
