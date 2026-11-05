@@ -44,7 +44,7 @@ from . import ed25519
 FORMAT = 'project-one-advisories/1'
 # Project One release keys (public halves). The private key lives only in the advisory repository's signing secret.
 TRUSTED_KEYS: dict[str, str] = {
-    'b0900af27f29c26aa3e3af2ebc152a4fc6e0bce3c97bdb5da4cfca6c2a808d77': 'Project One release key (2026-11)',
+    'efcccba5caed58d6442221066c30b06080c3e9106796b786d20019a62cfe55da': 'Project One release key (2026-11)',
 }
 OS_NAMES = ('IOS XE', 'IOS', 'NX-OS', 'PAN-OS', 'FortiOS')
 SEVERITIES = ('critical', 'high', 'medium', 'low', 'none')
@@ -465,22 +465,29 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
     """Assemble an unsigned bundle. ``extra``: a list of advisories in the bundle's own form (for sources without
     CSAF). ``requires``: {advisory id: [CONDITION, ...]}, the feature conditions curated by the publisher."""
     adv, sources = {}, []
-    for i, src in enumerate(csaf_sources):
+    def take(src, kind, docs, convert):
         n = 0
-        for doc in csaf_documents(src, since):
-            for a in from_csaf(doc, (vendor_hints or {}).get(src, '')):
-                adv[a['id']] = a
-                n += 1
-        sources.append({'source': src, 'kind': 'csaf', 'advisories': n,
-                        'fetched_at': datetime.now(timezone.utc).isoformat()})
+        try:
+            for doc in docs():
+                try:
+                    found = convert(doc)
+                except Exception as exc:                # one document the converter cannot read
+                    log.warning('Skipping a document from %s: %s', src, exc)
+                    continue
+                for a in found:
+                    adv[a['id']] = a
+                    n += 1
+            sources.append({'source': src, 'kind': kind, 'advisories': n,
+                            'fetched_at': datetime.now(timezone.utc).isoformat()})
+        except Exception as exc:                        # a source that cannot be reached: the others still count
+            log.error('Source %s failed: %s', src, exc)
+            sources.append({'source': src, 'kind': kind, 'advisories': n, 'error': str(exc)[:300]})
+        log.info('%s: %d advisories', src, n)
+    for src in csaf_sources:
+        take(src, 'csaf', lambda src=src: csaf_documents(src, since),
+             lambda doc, src=src: from_csaf(doc, (vendor_hints or {}).get(src, '')))
     if paloalto:
-        n = 0
-        for rec in paloalto_records():
-            for a in from_cve5(rec, 'paloalto'):
-                adv[a['id']] = a
-                n += 1
-        sources.append({'source': PAN_BASE, 'kind': 'cve5', 'advisories': n,
-                        'fetched_at': datetime.now(timezone.utc).isoformat()})
+        take(PAN_BASE, 'cve5', paloalto_records, lambda rec: from_cve5(rec, 'paloalto'))
     for a in extra or []:
         _check_advisory(a)
         adv[a['id']] = a
