@@ -1,0 +1,65 @@
+name: Build advisories
+
+on:
+  schedule:
+    - cron: '17 1 * * *'        # daily, 01:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-advisories
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and sign the bundle
+        env:
+          ADVISORY_SIGNING_KEY: ${{ secrets.ADVISORY_SIGNING_KEY }}
+        run: |
+          test -n "$ADVISORY_SIGNING_KEY" || { echo "::error::The ADVISORY_SIGNING_KEY secret is not set"; exit 1; }
+          umask 077
+          printf '%s\n' "$ADVISORY_SIGNING_KEY" > "$RUNNER_TEMP/signing.key"
+          mkdir -p out
+          cd builder
+          python -m projectone.advisories build \
+            --csaf https://www.cisco.com/.well-known/csaf/provider-metadata.json \
+            --paloalto \
+            --extra ../curated/extra.json \
+            --requires ../curated/requires.json \
+            --key "$RUNNER_TEMP/signing.key" \
+            --out ../out/advisories.json --latest ../out/latest.json
+          rm -f "$RUNNER_TEMP/signing.key"
+      - name: Summary
+        run: |
+          python - <<'PY' > out/notes.md
+          import json, collections
+          b = json.load(open('out/advisories.json'))
+          by = collections.Counter(a['os'] for a in b['advisories'])
+          print(f"Bundle `{b['bundle_id']}` built {b['built_at'][:16]} UTC: **{len(b['advisories'])} advisories**.\n")
+          print('| Operating system | Advisories |\n|---|---|')
+          for k, n in sorted(by.items()):
+              print(f'| {k} | {n} |')
+          print('\nSources: ' + ', '.join(f"{s['source']} ({s['advisories']})" for s in b['sources']))
+          print(f"\nSigned with key `{b.get('key_id')}`.")
+          PY
+          cat out/notes.md >> "$GITHUB_STEP_SUMMARY"
+          python -c "import json,sys; b=json.load(open('out/advisories.json')); sys.exit(0 if len(b['advisories']) > 0 else 1)" \
+            || { echo "::error::The bundle is empty: not publishing"; exit 1; }
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(python -c "import json; print(json.load(open('out/latest.json'))['bundle_id'])")
+          gh release create "$id" out/advisories.json out/latest.json --title "Advisories $id" --notes-file out/notes.md --latest
+          # keep the newest 30 releases
+          gh release list --limit 200 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[30:][].tagName' \
+            | xargs -r -n1 gh release delete --cleanup-tag --yes
