@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -299,12 +300,40 @@ def from_csaf(doc: dict, vendor_hint: str = '') -> list[dict]:
     return res
 
 
-def _fetch(url: str, limit=20 * 1024 * 1024) -> bytes:
+USER_AGENT = ('Mozilla/5.0 (compatible; ProjectOneAdvisoryBuilder/1.0; '
+              '+https://github.com/dinz-codes/project-one-advisories)')
+
+
+def _fetch(url: str, limit=200 * 1024 * 1024, tries=3) -> bytes:
+    """One https document, read to the end (large answers arrive in pieces); retried with a pause when the connection
+    breaks or the server is busy. A document larger than ``limit`` is refused rather than cut."""
+    import http.client
+    import time
     if not url.startswith('https://'):
         raise ValueError('Only https sources are fetched')
-    req = urllib.request.Request(url, headers={'User-Agent': 'project-one-advisory-builder', 'Accept': 'application/json'})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read(limit)
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, 'Accept': 'application/json, text/csv, */*',
+                                               'Accept-Language': 'en'})
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                parts, size = [], 0
+                while True:
+                    chunk = r.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > limit:
+                        raise ValueError(f'{url} is larger than {limit // (1024 * 1024)} MB')
+                    parts.append(chunk)
+                return b''.join(parts)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == tries - 1:
+                raise
+        except (http.client.IncompleteRead, ConnectionError, TimeoutError, urllib.error.URLError):
+            if attempt == tries - 1:
+                raise
+        time.sleep(5 * (attempt + 1))
+    raise RuntimeError('unreachable')
 
 
 def csaf_documents(source: str, since: str | None = None):
@@ -445,9 +474,16 @@ def _sev_from_score(score: float) -> str:
 
 def paloalto_records(product='PAN-OS', base=PAN_BASE):
     """Every advisory for a Palo Alto product as CVE JSON 5 records (the vendor's public advisory API)."""
-    data = json.loads(_fetch(f'{base}/api/v1/products/{urllib.parse.quote(product)}/advisories'))
+    try:
+        data = json.loads(_fetch(f'{base}/api/v1/products/{urllib.parse.quote(product)}/advisories'))
+    except Exception as exc:                            # the full list is large: fall back to the lighter list
+        log.warning('%s: product list failed (%s); using /json?product=', base, exc)
+        data = json.loads(_fetch(f'{base}/json?product={urllib.parse.quote(product)}'))
     items = data if isinstance(data, list) else (data.get('data') or data.get('advisories') or data.get('items') or [])
-    log.info('%s: %d %s advisories listed', base, len(items), product)
+    if items:
+        first = items[0]
+        log.info('%s: %d %s advisories listed (first item: %s)', base, len(items), product,
+                 sorted(first)[:12] if isinstance(first, dict) else type(first).__name__)
     ids = []
     for it in items:
         if isinstance(it, dict) and it.get('containers'):
