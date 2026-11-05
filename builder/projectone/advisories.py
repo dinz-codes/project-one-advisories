@@ -139,12 +139,33 @@ def packaged() -> dict | None:
     return _packaged_cache['bundle']
 
 
+_own_cache: dict = {}
+
+
+def _own() -> dict | None:
+    """The installation's saved bundle, checked again (signature against the keys trusted NOW) whenever the file or the
+    trusted keys change. A bundle whose key is no longer trusted, e.g. a lab test file, is not used."""
+    path = store_dir() / 'current.json'
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size, tuple(sorted(trusted_keys())), os.getenv('PROJECT_ONE_ADVISORY_ALLOW_UNSIGNED'))
+    if _own_cache.get('key') != key:
+        try:
+            b = json.loads(path.read_text(encoding='utf-8'))
+            trust = check({k: v for k, v in b.items() if not k.startswith('_')})
+            b['_trust'] = trust['trust']
+        except (OSError, ValueError) as exc:
+            log.warning('The saved advisory bundle is not used: %s', exc)
+            b = None
+        _own_cache.update(key=key, bundle=b)
+    return _own_cache['bundle']
+
+
 def current() -> dict | None:
     """The bundle in use: the installation's own (newest downloaded or imported), else the one shipped with it."""
-    try:
-        own = json.loads((store_dir() / 'current.json').read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        own = None
+    own = _own()
     ship = packaged()
     if own and ship and (ship.get('built_at') or '') > (own.get('built_at') or ''):
         return ship                                     # a newer release shipped a newer bundle
@@ -182,7 +203,10 @@ def import_bundle(data: bytes | str, *, user='cli') -> dict:
     d.mkdir(parents=True, exist_ok=True)
     cur = d / 'current.json'
     if cur.exists():
-        old = current() or {}
+        try:
+            old = json.loads(cur.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            old = {}
         cur.replace(d / f'previous-{old.get("bundle_id", "unknown")}.json')
     bundle = dict(bundle, _imported_at=datetime.now(timezone.utc).isoformat(), _imported_by=user, _trust=trust['trust'])
     tmp = d / 'current.tmp'
@@ -284,9 +308,9 @@ def from_csaf(doc: dict, vendor_hint: str = '') -> list[dict]:
                  if isinstance(n, dict)}
         cond = notes.get('vulnerable products') or notes.get('details') or ''
         if cond:
-            a['conditions_text'] = cond[:2000]
+            a['conditions_text'] = cond[:12000]
         if notes.get('workarounds'):
-            a['workaround'] = notes['workarounds'][:2000]
+            a['workaround'] = notes['workarounds'][:4000]
         if pid in affected_ids:
             if cat == 'product_version_range':
                 r = _vers_range(name)
@@ -393,6 +417,119 @@ def _fetch_many(urls, workers=8):
 # ------------------------------------------------------------------ CVE JSON 5 records (Palo Alto Networks)
 PAN_BASE = 'https://security.paloaltonetworks.com'
 NO_CONFIG = re.compile(r'no special configuration is required', re.I)
+
+# ------------------------------------------------------------------ Cisco: feature conditions read from the advisory text
+# Each entry: how Cisco names the feature in the "Vulnerable Products" sentence, and the running-config lines that show it
+# switched on, per operating system. present=False means "on unless this line is there" (features enabled by default).
+# An advisory gets conditions only when its condition sentence names features from this list and nothing else is
+# unrecognised; the device is then affected if ANY named feature is on, not affected only if ALL are provably off.
+_IOS = ('IOS', 'IOS XE')
+CISCO_FEATURES = [
+    ('HTTP Server / web UI', r'HTTP Server|HTTP server|web UI|WebUI|web-based (management|user) interface|HTTPS? (server|service)|'
+                             r'\bHTTPS?\b(?= (or HTTPS )?(is|are) enabled)',
+     {_IOS: r'^ip http (secure-)?server\b'}),
+    ('SD-WAN', r'SD-WAN|Controller mode', {_IOS: r'^sdwan\b|^\s*tunnel mode sdwan|^system\s*$'}),
+    ('SNMPv3', r'\bSNMPv3\b', {_IOS + ('NX-OS',): r'^snmp-server (group \S+ v3|user \S+ \S+ v3|user \S+ .*(auth|priv))'}),
+    ('SNMP', r'\bSNMP(v[12]c?)?\b(?!v3)', {_IOS + ('NX-OS',): r'^snmp-server (community|group|user|host)\b'}),
+    ('IKEv2 / IPsec VPN', r'IKEv2|Internet Key Exchange Version 2|G-IKEv2|FlexVPN',
+     {_IOS: r'^crypto ikev2\b|^crypto map\b|tunnel protection ipsec|^crypto gdoi'}),
+    ('ISAKMP / IKEv1 VPN', r'ISAKMP|IKEv1|Internet Security Association and Key Management Protocol|Internet Key Exchange Version 1|'
+                           r'IPsec VPN|terminate IPsec',
+     {_IOS: r'^crypto (isakmp|map|ipsec|ikev2)\b|tunnel protection ipsec'}),
+    ('GDOI', r'\bGDOI\b|Group Domain of Interpretation', {_IOS: r'^crypto gdoi|^crypto ikev2|gdoi'}),
+    ('Smart Install', r'Smart Install', {_IOS: (r'^no vstack\b', False)}),
+    ('DHCP relay / server', r'DHCP (relay|server)|ip helper-address|DHCP Relay',
+     {_IOS: r'ip helper-address|^ip dhcp pool|^ip dhcp relay|ipv6 dhcp (relay|server)'}),
+    ('DHCPv6', r'DHCPv6', {_IOS: r'ipv6 dhcp'}),
+    ('Cisco Discovery Protocol', r'Cisco Discovery Protocol|\bCDP\b', {_IOS + ('NX-OS',): (r'^no cdp (run|enable)\s*$', False)}),
+    ('TACACS+', r'TACACS', {_IOS + ('NX-OS',): r'tacacs'}),
+    ('NAT', r'\bNAT\b|Network Address Translation', {_IOS: r'^ip nat\b|ip nat (inside|outside)'}),
+    ('IS-IS', r'\bIS-IS\b|\bISIS\b', {_IOS + ('NX-OS',): r'^router isis'}),
+    ('OSPF', r'\bOSPF', {_IOS + ('NX-OS',): r'^router ospf'}),
+    ('BGP', r'\bBGP\b|Border Gateway Protocol', {_IOS + ('NX-OS',): r'^router bgp'}),
+    ('EIGRP', r'\bEIGRP\b', {_IOS + ('NX-OS',): r'^router eigrp'}),
+    ('L2TP', r'\bL2TP', {_IOS: r'l2tp|^vpdn'}),
+    ('BFD', r'\bBFD\b|Bidirectional Forwarding Detection', {_IOS + ('NX-OS',): r'^\s*bfd\b|^feature bfd'}),
+    ('mDNS gateway', r'mDNS', {_IOS: r'mdns-sd'}),
+    ('UDLD', r'\bUDLD\b|UniDirectional Link Detection', {_IOS + ('NX-OS',): r'udld'}),
+    ('PROFINET', r'PROFINET', {_IOS: r'profinet'}),
+    ('CIP', r'Common Industrial Protocol|\bCIP\b', {_IOS: r'^\s*cip enable'}),
+    ('SCP server', r'SCP server|Secure Copy', {_IOS: r'^ip scp server enable'}),
+    ('NETCONF', r'NETCONF', {_IOS: r'^netconf'}),
+    ('RESTCONF', r'RESTCONF', {_IOS: r'^restconf'}),
+    ('NX-API', r'NX-API', {('NX-OS',): r'^feature nxapi'}),
+    ('LLDP', r'\bLLDP\b|Link Layer Discovery Protocol', {_IOS: r'^lldp run', ('NX-OS',): r'^feature lldp'}),
+    ('PPPoE', r'PPPoE|PPP over Ethernet', {_IOS: r'pppoe'}),
+    ('ISDN / dialer', r'\bISDN\b|dialer', {_IOS: r'isdn|^interface (Dialer|BRI)|dialer'}),
+    ('Multicast / PIM', r'\bPIM\b|multicast routing|IP multicast', {_IOS + ('NX-OS',): r'ip multicast-routing|ip pim|^feature pim'}),
+    ('NTP', r'\bNTP\b|Network Time Protocol', {_IOS + ('NX-OS',): r'^ntp '}),
+    ('DMVPN / NHRP', r'DMVPN|\bNHRP\b', {_IOS: r'ip nhrp|tunnel mode gre multipoint'}),
+    ('Zone-Based Firewall', r'Zone-Based (Policy )?Firewall|\bZBFW\b', {_IOS: r'^zone-pair|zone-member security'}),
+    ('IOx', r'\bIOx\b', {_IOS: r'^iox\b'}),
+    ('Guest Shell', r'Guest Shell', {_IOS: r'guestshell|^iox\b'}),
+    ('UTD / Snort IPS', r'\bUTD\b|Unified Threat Defense|Snort', {_IOS: r'^utd\b|utd engine'}),
+    ('LISP', r'\bLISP\b|Locator/ID Separation', {_IOS: r'^router lisp'}),
+    ('Ethernet CFM', r'Connectivity Fault Management|\bCFM\b', {_IOS: r'ethernet cfm'}),
+    ('MPLS LDP', r'\bLDP\b|Label Distribution Protocol', {_IOS: r'mpls ldp|mpls ip'}),
+    ('SSH server', r'SSH server|Secure Shell \(SSH\) server|SSH connections', {_IOS: r'^ip ssh|transport input .*ssh'}),
+    ('DHCP snooping', r'DHCP snooping', {_IOS: r'ip dhcp snooping'}),
+    ('802.1X', r'802\.1X|IEEE 802\.1x', {_IOS: r'dot1x'}),
+    ('Web authentication', r'web authentication|WebAuth', {_IOS: r'ip admission|webauth|web-auth'}),
+    ('IPv6', r'IPv6 (is )?(enabled|configured)|configured (for|with) IPv6', {_IOS: r'^\s*ipv6 (address|enable|unicast-routing)'}),
+    ('Wireless controller', r'Embedded Wireless Controller|Catalyst 9800|wireless controller', {_IOS: r'^wlan |^wireless '}),
+    ('RSVP', r'\bRSVP\b', {_IOS: r'rsvp'}),
+    ('DECnet', r'DECnet', {_IOS: r'decnet'}),
+    ('TWAMP', r'\bTWAMP\b', {_IOS: r'twamp'}),
+    ('BEEP', r'\bBEEP\b', {_IOS: r'\bbeep\b'}),
+    ('XMCP', r'\bXMCP\b', {_IOS: r'xmcp'}),
+    ('AppNav-XE', r'AppNav', {_IOS: r'appnav|service-insertion'}),
+    ('Virtual fragment reassembly', r'\bVFR\b|Virtual Fragmentation Reassembly', {_IOS: r'ip virtual-reassembly'}),
+    ('SD-Access fabric', r'SD-Access|fabric edge', {}),
+    ('Telnet', None, {}),     # recognised but not modelled: the VTY default differs by release
+    ('AAA command authorization', r'command authorization', {}),
+    ('VTP', r'\bVTP\b', {}),
+]
+_ENABLING = re.compile(r'\b(enabled|configured|in [Cc]ontroller mode|accept \w+ connections|running .{0,60}\bwith\b|if (they|it|the device) (has|have|had|use|uses)|'
+                       r'when .{0,40}\b(is|are) (enabled|configured|in use))', re.I)
+_NO_CONFIG_CISCO = re.compile(r'regardless of (the )?(device )?configuration|in (the|their) default configuration|'
+                              r'no (specific|special) configuration', re.I)
+
+
+def _condition_sentence(text: str) -> str:
+    """The statement of what makes a device vulnerable: the first paragraph of Cisco's "Vulnerable Products"."""
+    head = re.split(r'\n\s*\n|Determin(e|ing) (the|whether)|Products Confirmed Not Vulnerable', text or '', maxsplit=1)[0]
+    return head[:1500]
+
+
+def cisco_conditions(a: dict):
+    """Feature conditions for one Cisco advisory, read from its condition sentence: (conditions, mode) or None."""
+    sent = _condition_sentence(a.get('conditions_text') or '')
+    if not sent:
+        return None
+    if _NO_CONFIG_CISCO.search(sent):
+        return 'none'
+    if not _ENABLING.search(sent):
+        return None
+    conds, unmodelled = [], False
+    for name, phrase, pats in CISCO_FEATURES:
+        if not phrase or not re.search(phrase, sent):
+            continue
+        pat = next((p for oses, p in pats.items() if a['os'] in oses), None)
+        if pat is None:
+            unmodelled = True
+            continue
+        pattern, present = pat if isinstance(pat, tuple) else (pat, True)
+        conds.append({'feature': name, 'op': 'running_config', 'pattern': pattern, 'present': present,
+                      'source': 'vendor text'})
+    if not conds or unmodelled:
+        return None
+    # "A or B enabled" with only one alternative recognised: an "off" there does not clear the device
+    cleaned = re.sub(r'Cisco [\w\s\-/,()]*?(Software|Series)|IOS (or|and) IOS XE|autonomous or controller mode|HTTP or HTTPS', '', sent)
+    alternatives = re.search(r'\b(or|either|one of|any of|including)\b', cleaned, re.I)
+    clear = not alternatives or (len(conds) >= 2 and not re.search(r'\b(one of|any of|including)\b', cleaned, re.I))
+    for c in conds:
+        c['clear'] = clear
+    return conds
 
 
 def _bump(v: str) -> str:
@@ -566,9 +703,20 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
         adv[a['id']] = a
     if extra:
         sources.append({'source': 'curated', 'kind': 'project-one', 'advisories': len(extra)})
-    for aid, conds in (requires or {}).items():
+    derived = 0
+    for a in adv.values():
+        if a.get('vendor') == 'cisco' and not a.get('requires'):
+            got = cisco_conditions(a)
+            if got == 'none':
+                a['config_required'] = False
+            elif got:
+                a['requires'], a['requires_mode'] = got, 'any'
+                derived += 1
+    log.info('Cisco feature conditions read from the advisory text: %d advisories', derived)
+    for aid, conds in (requires or {}).items():             # curated conditions win
         for key in [k for k in adv if k == aid or k.startswith(aid + ':')]:
             adv[key]['requires'] = conds
+            adv[key].pop('requires_mode', None)
     now = datetime.now(timezone.utc)
     bundle = {'format': FORMAT, 'bundle_id': now.strftime('%Y%m%dT%H%M%SZ'), 'built_at': now.isoformat(),
               'sources': sources, 'advisories': sorted(adv.values(), key=lambda a: a['id'])}
