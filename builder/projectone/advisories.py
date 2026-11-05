@@ -514,6 +514,74 @@ _NO_CONFIG_CISCO = re.compile(r'regardless of (the )?(device )?configuration|in 
                               r'no (specific|special) configuration', re.I)
 
 
+# ------------------------------------------------------------------ Palo Alto: feature conditions from "Required Configuration"
+# Each entry: the wording in the advisory, and where the feature shows in the collected configuration (JSON, secrets
+# removed): (op, pattern, present). Features Project One cannot read yet are listed with no evidence, so an advisory
+# naming them is left to check rather than cleared.
+PAN_FEATURES = [
+    ('GlobalProtect portal', r'GlobalProtect portal(?! or gateway)', ('cfg_gp', r'"global-protect-portal"', True)),
+    ('GlobalProtect gateway', r'GlobalProtect gateway(?!.{0,20}portal)', ('cfg_gp', r'"global-protect-gateway"', True)),
+    ('GlobalProtect portal or gateway', r'GlobalProtect (portal or gateway|portal and gateway|VPN, gateway, or portal|gateway or portal)|'
+                                        r'GlobalProtect (VPN|portals? and gateways?)',
+     ('cfg_gp', r'"global-protect-(portal|gateway)"', True)),
+    ('GlobalProtect Clientless VPN', r'Clientless VPN', ('cfg_gp', r'clientless', True)),
+    ('Large Scale VPN satellites', r'Large Scale VPN|LSVPN', ('cfg_gp', r'satellite', True)),
+    ('Management web interface', r'web-based management interface|management web interface', ('cfg_system', r'"disable-https":\s*"yes"', False)),
+    ('Telnet service', r'Telnet', ('cfg_system', r'"disable-telnet":\s*"no"', True)),
+    ('System proxy server', r'proxy server', ('cfg_system', r'"secure-proxy-server"', True)),
+    ('Log forwarding', r'log forwarding', ('cfg_log', r'"(syslog|email|http|snmptrap)"', True)),
+    ('External Dynamic List', r'External Dynamic List|\bEDL\b', ('cfg_edl', r'"entry"|"type"', True)),
+    ('SAML authentication', r'\bSAML\b', ('cfg_saml', r'"entry"|"sso-url"|"entity-id"', True)),
+    ('Captive Portal', r'Captive Portal|Authentication Portal', None),
+    ('XML API', r'XML API', None),
+    ('WildFire', r'WildFire', None),
+    ('Decryption', r'SSL Forward Proxy|SSL Inbound Inspection|decryption', None),
+    ('GTP security', r'\bGTP\b', None),
+    ('Multi-factor authentication', r'Multi-Factor|\bMFA\b', None),
+    ('Custom admin role', r'custom role', None),
+    ('Panorama', r'Panorama', None),
+    ('URL filtering exceptions', r'URL filtering|URL category', None),
+    ('BGP', r'\bBGP\b', None),
+    ('Dynamic updates', r'dynamic updates', None),
+    ('Scheduled configuration export', r'configuration export', None),
+]
+_PAN_NO_CONFIG = re.compile(r'no special configuration is required|There is no specific configuration required|'
+                            r'^The risk (of this issue )?is greatest', re.I)
+_PAN_ONLY = re.compile(r'\b(applicable only|only applicable|applies only|only affects|requires|is exploitable only|'
+                       r'only (to|if|when|where))\b', re.I)
+
+
+def pan_conditions(a: dict):
+    """Feature conditions for one Palo Alto advisory from its "Required Configuration for Exposure" text:
+    'none' (no configuration needed), a list of conditions, or None (cannot be decided from the configuration)."""
+    sent = re.split(r'\n\s*\n', (a.get('conditions_text') or '').strip(), maxsplit=1)[0][:1200]
+    if not sent or sent.strip().upper() in ('N/A', 'TBD'):
+        return None
+    if _PAN_NO_CONFIG.search(sent):
+        return 'none'
+    if not _PAN_ONLY.search(sent):
+        return None
+    conds, unmodelled = [], False
+    for name, phrase, ev in PAN_FEATURES:
+        if not re.search(phrase, sent, re.I):
+            continue
+        if ev is None:
+            unmodelled = True
+            continue
+        op, pattern, present = ev
+        if any(c['pattern'] == pattern for c in conds):
+            continue
+        conds.append({'feature': name, 'op': op, 'pattern': pattern, 'present': present, 'source': 'vendor text'})
+    if not conds or unmodelled:
+        return None
+    cleaned = re.sub(r'firewalls? and Panoramas?|hardware or virtual appliance|portal (or|and) gateway|gateway or portal|'
+                     r'VPN, gateway, or portal', '', sent, flags=re.I)
+    alternatives = re.search(r'\b(or|either|one of|any of|including)\b', cleaned, re.I)
+    for c in conds:
+        c['clear'] = not alternatives or len(conds) >= 2
+    return conds
+
+
 def _condition_sentence(text: str) -> str:
     """The statement of what makes a device vulnerable: the first paragraph of Cisco's "Vulnerable Products"."""
     head = re.split(r'\n\s*\n|Determin(e|ing) (the|whether)|Products Confirmed Not Vulnerable', text or '', maxsplit=1)[0]
@@ -731,7 +799,16 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
             elif got:
                 a['requires'], a['requires_mode'] = got, 'any'
                 derived += 1
-    log.info('Cisco feature conditions read from the advisory text: %d advisories', derived)
+    pan = 0
+    for a in adv.values():
+        if a.get('vendor') == 'paloalto' and not a.get('requires') and a.get('config_required') is not False:
+            got = pan_conditions(a)
+            if got == 'none':
+                a['config_required'] = False
+            elif got:
+                a['requires'], a['requires_mode'] = got, 'any'
+                pan += 1
+    log.info('Cisco feature conditions read from the advisory text: %d advisories; Palo Alto: %d', derived, pan)
     for aid, conds in (requires or {}).items():             # curated conditions win
         for key in [k for k in adv if k == aid or k.startswith(aid + ':')]:
             adv[key]['requires'] = conds
