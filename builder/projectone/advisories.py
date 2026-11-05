@@ -280,6 +280,13 @@ def from_csaf(doc: dict, vendor_hint: str = '') -> list[dict]:
                                      'updated': track.get('current_release_date'), 'severity': severity, 'cvss': cvss,
                                      'cves': sorted(cves), 'os': os_name,
                                      'affected': {'versions': [], 'ranges': []}, 'fixed': [], 'requires': []})
+        notes = {str(n.get('title') or '').strip().lower(): str(n.get('text') or '').strip() for n in d.get('notes') or []
+                 if isinstance(n, dict)}
+        cond = notes.get('vulnerable products') or notes.get('details') or ''
+        if cond:
+            a['conditions_text'] = cond[:2000]
+        if notes.get('workarounds'):
+            a['workaround'] = notes['workarounds'][:2000]
         if pid in affected_ids:
             if cat == 'product_version_range':
                 r = _vers_range(name)
@@ -385,6 +392,7 @@ def _fetch_many(urls, workers=8):
 
 # ------------------------------------------------------------------ CVE JSON 5 records (Palo Alto Networks)
 PAN_BASE = 'https://security.paloaltonetworks.com'
+NO_CONFIG = re.compile(r'no special configuration is required', re.I)
 
 
 def _bump(v: str) -> str:
@@ -426,25 +434,40 @@ def from_cve5(rec: dict, vendor: str = 'paloalto') -> list[dict]:
             'updated': (rec.get('cveMetadata') or {}).get('dateUpdated'),
             'severity': sev, 'cvss': score[0] if score else None, 'cves': [cve], 'os': os_name,
             'affected': {'versions': [], 'ranges': []}, 'fixed': [],
-            'conditions_text': texts('configurations')[:2000] or None, 'workaround': texts('workarounds')[:2000] or None})
+            'conditions_text': texts('configurations')[:2000] or None, 'workaround': texts('workarounds')[:2000] or None,
+            'config_required': False if NO_CONFIG.search(texts('configurations')) else None})
         for v in aff.get('versions') or []:
             if v.get('status') != 'affected' or not re.match(r'^\d', str(v.get('version', ''))):
                 continue
             start, end = str(v['version']), v.get('lessThan') or v.get('lessThanOrEqual')
+            whole = re.fullmatch(r'(\d+)\.(\d+)\.0', start)
+            if not end and whole and vendor == 'paloalto':
+                # "10.2.0 affected" with no upper bound: Palo Alto means the whole 10.2 release (safer than one version)
+                v = dict(v, lessThan=f'{whole[1]}.{int(whole[2]) + 1}.0')
+                end = v['lessThan']
+                train_wide = True
+            else:
+                train_wide = False
             if not end:
                 a['affected']['versions'].append(start)
                 continue
             cuts = sorted({c['at'] for c in v.get('changes') or [] if c.get('status') == 'unaffected' and c.get('at')},
                           key=_vkey)
-            lo = start
+            lo, stopped = start, False
             for c in cuts:
-                a['affected']['ranges'].append({'introduced': lo, 'fixed': c})
-                a['fixed'].append(c)
-                lo = _bump(c)
+                if _vkey(lo) < _vkey(c):
+                    a['affected']['ranges'].append({'introduced': lo, 'fixed': c})
+                    a['fixed'].append(c)
+                if '-h' not in c:                       # a full release fixes everything after it
+                    stopped = True
+                    break
+                lo = max(lo, _bump(c), key=_vkey)
+            if stopped:
+                continue
             if _vkey(lo) < _vkey(end) or (v.get('lessThanOrEqual') and _vkey(lo) <= _vkey(end)):
                 a['affected']['ranges'].append({'introduced': lo, 'fixed': end} if v.get('lessThan') else
                                                {'introduced': lo, 'last_affected': end})
-                if v.get('lessThan'):
+                if v.get('lessThan') and not train_wide:
                     a['fixed'].append(end)
     res = []
     for os_name, a in out.items():
@@ -501,6 +524,8 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
     """Assemble an unsigned bundle. ``extra``: a list of advisories in the bundle's own form (for sources without
     CSAF). ``requires``: {advisory id: [CONDITION, ...]}, the feature conditions curated by the publisher."""
     adv, sources = {}, []
+    coverage = {}
+
     def take(src, kind, docs, convert):
         n = 0
         try:
@@ -524,6 +549,18 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
              lambda doc, src=src: from_csaf(doc, (vendor_hints or {}).get(src, '')))
     if paloalto:
         take(PAN_BASE, 'cve5', paloalto_records, lambda rec: from_cve5(rec, 'paloalto'))
+        # Palo Alto's API lists advisories for supported releases only: record which releases it covers, so a device on
+        # another release (end of life) is "not assessed" rather than shown with no advisories
+        trains = set()
+        for a in adv.values():
+            if a['os'] == 'PAN-OS' and a.get('vendor') == 'paloalto':
+                for v in a['affected']['versions'] + [r['introduced'] for r in a['affected']['ranges']]:
+                    m = re.match(r'(\d+\.\d+)', v)
+                    if m:
+                        trains.add(m[1])
+        if trains:
+            coverage['PAN-OS'] = {'trains': sorted(trains, key=_vkey),
+                                  'note': "Palo Alto Networks' advisory API covers supported releases only"}
     for a in extra or []:
         _check_advisory(a)
         adv[a['id']] = a
@@ -535,6 +572,8 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
     now = datetime.now(timezone.utc)
     bundle = {'format': FORMAT, 'bundle_id': now.strftime('%Y%m%dT%H%M%SZ'), 'built_at': now.isoformat(),
               'sources': sources, 'advisories': sorted(adv.values(), key=lambda a: a['id'])}
+    if coverage:
+        bundle['coverage'] = coverage
     for a in bundle['advisories']:
         _check_advisory(a)
     return bundle
