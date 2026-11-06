@@ -342,8 +342,10 @@ def _fetch(url: str, limit=200 * 1024 * 1024, tries=3, retry_403=False) -> bytes
     import time
     if not url.startswith('https://'):
         raise ValueError('Only https sources are fetched')
+    import gzip
+    import zlib
     req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, 'Accept': 'application/json, text/csv, */*',
-                                               'Accept-Language': 'en'})
+                                               'Accept-Language': 'en', 'Accept-Encoding': 'gzip'})
     for attempt in range(tries):
         try:
             with urllib.request.urlopen(req, timeout=180) as r:
@@ -356,11 +358,15 @@ def _fetch(url: str, limit=200 * 1024 * 1024, tries=3, retry_403=False) -> bytes
                     if size > limit:
                         raise ValueError(f'{url} is larger than {limit // (1024 * 1024)} MB')
                     parts.append(chunk)
-                return b''.join(parts)
+                data = b''.join(parts)
+                if (r.headers.get('Content-Encoding') or '').lower() == 'gzip':
+                    data = gzip.decompress(data)      # a cut-off download fails its own check here and is retried
+                return data
         except urllib.error.HTTPError as exc:
             if exc.code not in (429, 500, 502, 503, 504) + ((403,) if retry_403 else ()) or attempt == tries - 1:
                 raise
-        except (http.client.IncompleteRead, ConnectionError, TimeoutError, urllib.error.URLError):
+        except (http.client.IncompleteRead, ConnectionError, TimeoutError, urllib.error.URLError, EOFError, zlib.error,
+                gzip.BadGzipFile):
             if attempt == tries - 1:
                 raise
         time.sleep((15 if retry_403 else 5) * (attempt + 1))
@@ -721,11 +727,18 @@ def _sev_from_score(score: float) -> str:
 
 def paloalto_records(product='PAN-OS', base=PAN_BASE):
     """Every advisory for a Palo Alto product as CVE JSON 5 records (the vendor's public advisory API)."""
-    try:
-        data = json.loads(_fetch(f'{base}/api/v1/products/{urllib.parse.quote(product)}/advisories'))
-    except Exception as exc:                            # the full list is large: fall back to the lighter list
-        log.warning('%s: product list failed (%s); using /json?product=', base, exc)
-        data = json.loads(_fetch(f'{base}/json?product={urllib.parse.quote(product)}'))
+    import time
+    url = f'{base}/api/v1/products/{urllib.parse.quote(product)}/advisories'
+    data = None
+    for attempt in range(4):                            # the full list is large and sometimes arrives cut off
+        try:
+            data = json.loads(_fetch(url))
+            break
+        except ValueError as exc:
+            log.warning('%s: the advisory list arrived incomplete (%s); trying again', base, exc)
+            time.sleep(20 * (attempt + 1))
+    if data is None:                                    # never fall back to a partial list: the source fails
+        raise RuntimeError(f'the {product} advisory list arrived incomplete 4 times')
     items = data if isinstance(data, list) else (data.get('data') or data.get('advisories') or data.get('items') or [])
     if items:
         first = items[0]
