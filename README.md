@@ -20,7 +20,7 @@ against the Project One release key, and only then uses it. Customers do nothing
 |---|---|---|
 | Cisco | IOS, IOS XE, NX-OS | Cisco PSIRT CSAF 2.0 provider (`https://www.cisco.com/.well-known/csaf/provider-metadata.json`) |
 | Palo Alto Networks | PAN-OS | Palo Alto Networks security advisory API (CVE JSON 5 records) |
-| Fortinet | FortiOS | Not yet: Fortinet does not publish machine-readable advisories. Until then Project One shows FortiGates as *not assessed*, never as clean. |
+| Fortinet | FortiOS | Fortinet's own CVE records (the CVE project's `cvelistV5`: every published record Fortinet issued that names FortiOS, with affected versions), cross-checked every day against Fortinet's PSIRT RSS feed (`https://www.fortiguard.com/rss/ir.xml`): any advisory the feed lists that the bundle lacks is named in the release notes. Fortinet's records give no feature condition or fixed release, so a version match is shown as affected without the feature check. |
 
 The advisory facts (affected and fixed versions, severity, CVEs, links) come from the vendors' public advisories;
 each entry links to the vendor's page, which remains the authority. `curated/requires.json` adds, per advisory, the
