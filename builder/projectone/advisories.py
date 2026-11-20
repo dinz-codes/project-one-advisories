@@ -19,7 +19,8 @@ Building a bundle (the publisher's machine, with internet):
     python -m projectone.advisories keygen --out ~/.project-one/advisory-signing.key
     python -m projectone.advisories build --csaf <folder or provider-metadata URL> [--csaf ...] [--extra extra.json]
                                           [--requires requires.json] --key ~/.project-one/advisory-signing.key --out bundle.json
-    (--paloalto adds PAN-OS advisories from the vendor's public API; --latest writes latest.json for the update service)
+    (--paloalto adds PAN-OS advisories from the vendor's public API; --fortinet <cvelistV5 folder> adds FortiOS from
+    Fortinet's own CVE records, and --fortinet-rss <PSIRT feed> lists any advisory it names that the bundle lacks; --latest writes latest.json for the update service)
 Updating (each installation): automatic, daily, from the update service (projectone/advisory_feed.py); the bundle
 shipped in a release (projectone/data/advisories.json) is used until then. Offline installations import a file:
     python -m projectone.advisories import bundle.json          (or Vulnerabilities > Import advisories, admin)
@@ -278,7 +279,7 @@ def from_csaf(doc: dict, vendor_hint: str = '') -> list[dict]:
     url = next((r.get('url') for r in d.get('references', []) if r.get('category') == 'self'), None) or \
         next((r.get('url') for r in d.get('references', [])), None)
     vendor = vendor_hint or ((d.get('publisher') or {}).get('name') or '').split()[0].lower()
-    cves, affected_ids, fixed_ids, scores = set(), set(), set(), []
+    cves, affected_ids, fixed_ids, scores, vecs = set(), set(), set(), [], []
     for v in doc.get('vulnerabilities') or []:
         if v.get('cve'):
             cves.add(v['cve'])
@@ -292,7 +293,9 @@ def from_csaf(doc: dict, vendor_hint: str = '') -> list[dict]:
             c = s.get('cvss_v3') or s.get('cvss_v4') or {}
             if isinstance(c.get('baseScore'), (int, float)):
                 scores.append(float(c['baseScore']))
+                vecs.append((float(c['baseScore']), attack_vector(c.get('vectorString'))))
     cvss = max(scores) if scores else None
+    vector = max(vecs, key=lambda x: x[0])[1] if vecs else None
     agg = ((d.get('aggregate_severity') or {}).get('text') or '').lower()
     severity = agg if agg in SEVERITIES else next((s for t, s in CVSS_SEVERITY if cvss is not None and cvss >= t), 'none')
     out = {}
@@ -301,7 +304,7 @@ def from_csaf(doc: dict, vendor_hint: str = '') -> list[dict]:
             continue
         a = out.setdefault(os_name, {'id': track.get('id') or d.get('title'), 'vendor': vendor, 'title': d.get('title'),
                                      'url': url, 'published': track.get('initial_release_date'),
-                                     'updated': track.get('current_release_date'), 'severity': severity, 'cvss': cvss,
+                                     'updated': track.get('current_release_date'), 'severity': severity, 'cvss': cvss, 'attack_vector': vector,
                                      'cves': sorted(cves), 'os': os_name,
                                      'affected': {'versions': [], 'ranges': []}, 'fixed': [], 'requires': []})
         notes = {str(n.get('title') or '').strip().lower(): str(n.get('text') or '').strip() for n in d.get('notes') or []
@@ -637,8 +640,14 @@ def _cvss(cna: dict):
         for k in ('cvssV4_0', 'cvssV3_1', 'cvssV3_0'):
             if isinstance(m.get(k), dict) and m[k].get('baseScore') is not None:
                 sc = m[k]
-                best = best or (float(sc['baseScore']), str(sc.get('baseSeverity') or '').lower())
+                best = best or (float(sc['baseScore']), str(sc.get('baseSeverity') or '').lower(), attack_vector(sc.get('vectorString')))
     return best
+
+
+def attack_vector(vector) -> str | None:
+    """'network' | 'adjacent' | 'local' | 'physical' from a CVSS vector string (AV:N ...), else None."""
+    m = re.search(r'\bAV:([NALP])\b', str(vector or ''))
+    return {'N': 'network', 'A': 'adjacent', 'L': 'local', 'P': 'physical'}[m[1]] if m else None
 
 
 def from_cve5(rec: dict, vendor: str = 'paloalto') -> list[dict]:
@@ -658,11 +667,11 @@ def from_cve5(rec: dict, vendor: str = 'paloalto') -> list[dict]:
         if not os_name:
             continue
         a = out.setdefault(os_name, {
-            'id': cve, 'vendor': vendor, 'title': (cna.get('title') or cve)[:300],
-            'url': f'{PAN_BASE}/{cve}' if vendor == 'paloalto' else next((r.get('url') for r in cna.get('references') or []), ''),
+            'id': cve, 'vendor': vendor, 'title': (cna.get('title') or _first_description(cna) or cve)[:300],
+            'url': f'{PAN_BASE}/{cve}' if vendor == 'paloalto' else _advisory_url(cna),
             'published': cna.get('datePublic') or (rec.get('cveMetadata') or {}).get('datePublished'),
             'updated': (rec.get('cveMetadata') or {}).get('dateUpdated'),
-            'severity': sev, 'cvss': score[0] if score else None, 'cves': [cve], 'os': os_name,
+            'severity': sev, 'cvss': score[0] if score else None, 'attack_vector': score[2] if score else None, 'cves': [cve], 'os': os_name,
             'affected': {'versions': [], 'ranges': []}, 'fixed': [],
             'conditions_text': texts('configurations')[:2000] or None, 'workaround': texts('workarounds')[:2000] or None,
             'config_required': False if NO_CONFIG.search(texts('configurations')) else None})
@@ -725,6 +734,61 @@ def _sev_from_score(score: float) -> str:
     return next((name for floor, name in CVSS_SEVERITY if score >= floor), 'none')
 
 
+def _first_description(cna: dict) -> str:
+    """Fortinet's CVE records carry no title: the first sentence of the English description stands in for it."""
+    for d in cna.get('descriptions') or []:
+        if isinstance(d, dict) and str(d.get('lang', 'en')).startswith('en') and d.get('value'):
+            return re.split(r'(?<=[.!?])\s', re.sub(r'<[^>]+>', ' ', d['value']).strip(), maxsplit=1)[0]
+    return ''
+
+
+def _advisory_url(cna: dict) -> str:
+    refs = [r.get('url') for r in cna.get('references') or [] if isinstance(r, dict) and r.get('url')]
+    return next((u for u in refs if 'fortiguard' in u and 'FG-IR' in u), refs[0] if refs else '')
+
+
+FG_IR = re.compile(r'FG-IR-\d{2}-\d{3,4}', re.I)
+
+
+def fortinet_records(cvelist):
+    """Every CVE record Fortinet published as a CNA that names FortiOS, from a checkout of the CVE project's record
+    list (github.com/CVEProject/cvelistV5, the folder that holds ``cves/``). Nothing is skipped silently: a file that
+    cannot be read is logged, and the PSIRT cross-check (psirt_ids / unmatched_psirt) shows what is still missing."""
+    root = Path(cvelist).expanduser()
+    root = root / 'cves' if (root / 'cves').is_dir() else root
+    if not root.is_dir():
+        raise RuntimeError(f'{cvelist} is not a folder: give the cvelistV5 checkout')
+    seen = 0
+    for f in sorted(root.rglob('CVE-*.json')):
+        try:
+            raw = f.read_text(encoding='utf-8')
+            if '"fortinet"' not in raw.lower() or 'fortios' not in raw.lower():
+                continue
+            rec = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            log.warning('%s: cannot read (%s)', f, exc)
+            continue
+        if str((rec.get('cveMetadata') or {}).get('assignerShortName', '')).lower() != 'fortinet':
+            continue
+        if (rec.get('cveMetadata') or {}).get('state') != 'PUBLISHED':
+            continue
+        seen += 1
+        yield rec
+    log.info('%s: %d Fortinet records name FortiOS', root, seen)
+
+
+def psirt_ids(feed_xml: str) -> set:
+    """The advisory ids (FG-IR-yy-nnn) a Fortinet PSIRT RSS feed lists."""
+    return {m.upper() for m in FG_IR.findall(feed_xml or '')}
+
+
+def unmatched_psirt(feed_ids, advisories) -> list:
+    """Advisory ids the PSIRT feed lists that no advisory in the bundle links to: either not a FortiOS issue, has no
+    CVE record yet, or was missed. The build reports them so nothing is lost without anyone seeing it."""
+    have = {m.upper() for a in advisories if a.get('vendor') == 'fortinet' for m in FG_IR.findall(a.get('url') or '')}
+    return sorted(set(feed_ids) - have)
+
+
 def paloalto_records(product='PAN-OS', base=PAN_BASE):
     """Every advisory for a Palo Alto product as CVE JSON 5 records (the vendor's public advisory API)."""
     import time
@@ -757,7 +821,8 @@ def paloalto_records(product='PAN-OS', base=PAN_BASE):
     yield from _fetch_many([f'{base}/json/{urllib.parse.quote(i)}' for i in dict.fromkeys(ids)])
 
 
-def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=None, paloalto=False) -> dict:
+def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=None, paloalto=False,
+          fortinet=None, fortinet_rss=None) -> dict:
     """Assemble an unsigned bundle. ``extra``: a list of advisories in the bundle's own form (for sources without
     CSAF). ``requires``: {advisory id: [CONDITION, ...]}, the feature conditions curated by the publisher."""
     adv, sources = {}, []
@@ -798,6 +863,19 @@ def build(csaf_sources=(), extra=None, requires=None, since=None, vendor_hints=N
         if trains:
             coverage['PAN-OS'] = {'trains': sorted(trains, key=_vkey),
                                   'note': "Palo Alto Networks' advisory API covers supported releases only"}
+    if fortinet:
+        take(str(fortinet), 'cve5', lambda: fortinet_records(fortinet), lambda rec: from_cve5(rec, 'fortinet'))
+        if fortinet_rss:                                # the cross-check: every advisory Fortinet lists must be accounted for
+            try:
+                feed = psirt_ids(_fetch(fortinet_rss).decode('utf-8', 'replace'))
+                missing = unmatched_psirt(feed, adv.values())
+                sources.append({'source': fortinet_rss, 'kind': 'psirt-rss', 'advisories': len(feed),
+                                'not_in_bundle': missing[:200], 'not_in_bundle_count': len(missing)})
+                if missing:
+                    log.warning('Fortinet PSIRT lists %d advisories that are not in the bundle: %s', len(missing), ', '.join(missing[:20]))
+            except Exception as exc:
+                log.error('Fortinet PSIRT feed failed: %s', exc)
+                sources.append({'source': fortinet_rss, 'kind': 'psirt-rss', 'advisories': 0, 'error': str(exc)[:300]})
     for a in extra or []:
         _check_advisory(a)
         adv[a['id']] = a
@@ -871,6 +949,8 @@ def main(argv=None):
     b.add_argument('--requires', help='feature conditions per advisory id (JSON object)')
     b.add_argument('--since', help='only CSAF documents changed on or after YYYY-MM-DD')
     b.add_argument('--paloalto', action='store_true', help="add Palo Alto Networks' PAN-OS advisories (their public API)")
+    b.add_argument('--fortinet', help="add FortiOS advisories from Fortinet's CVE records: the folder of a cvelistV5 checkout")
+    b.add_argument('--fortinet-rss', help="Fortinet's PSIRT RSS feed (https://www.fortiguard.com/rss/ir.xml): list advisories it names that the bundle lacks")
     b.add_argument('--latest', help='also write the small latest.json (bundle id, date, sha256) the update service serves')
     b.add_argument('--previous', help='the last published bundle: refuse to write a bundle that lost many advisories')
     b.add_argument('--key', help='signing key file (omit for an unsigned lab bundle)')
@@ -897,7 +977,7 @@ def main(argv=None):
         extra = json.loads(Path(a.extra).read_text(encoding='utf-8')) if a.extra else None
         requires = json.loads(Path(a.requires).read_text(encoding='utf-8')) if a.requires else None
         logging.basicConfig(level=logging.INFO, format='%(message)s')
-        bundle = build(a.csaf, extra, requires, a.since, paloalto=a.paloalto)
+        bundle = build(a.csaf, extra, requires, a.since, paloalto=a.paloalto, fortinet=a.fortinet, fortinet_rss=a.fortinet_rss)
         failed = [s for s in bundle['sources'] if s.get('error')]
         if a.previous and Path(a.previous).exists():
             lost = shrinkage(bundle, json.loads(Path(a.previous).read_text(encoding='utf-8')))

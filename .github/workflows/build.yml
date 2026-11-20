@@ -21,6 +21,13 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
+      - name: Fetch the CVE records (Fortinet publishes its FortiOS advisories there)
+        uses: actions/checkout@v5
+        with:
+          repository: CVEProject/cvelistV5
+          path: cvelist
+          fetch-depth: 1
+          sparse-checkout: cves
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -46,6 +53,8 @@ jobs:
           python -m projectone.advisories build \
             --csaf https://www.cisco.com/.well-known/csaf/provider-metadata.json \
             --paloalto \
+            --fortinet ../cvelist \
+            --fortinet-rss https://www.fortiguard.com/rss/ir.xml \
             --extra ../curated/extra.json \
             --requires ../curated/requires.json \
             --key "$RUNNER_TEMP/signing.key" \
@@ -67,10 +76,13 @@ jobs:
           print('\n| Source | Advisories | Problem |\n|---|---|---|')
           for s in b['sources']:
               print(f"| {s['source']} | {s['advisories']} | {s.get('error', '')} |")
+          for s in b['sources']:
+              if s.get('kind') == 'psirt-rss' and s.get('not_in_bundle_count'):
+                  print(f"\n**Fortinet PSIRT lists {s['not_in_bundle_count']} advisories that are not in the bundle** (often not FortiOS, or no CVE record yet): " + ', '.join(s['not_in_bundle'][:50]))
           print(f"\nSigned with key `{b.get('key_id')}`.")
           PY
           cat out/notes.md >> "$GITHUB_STEP_SUMMARY"
-          python -c "import json,sys; bad=[s for s in json.load(open('out/advisories.json'))['sources'] if s.get('error')]; [print('::error::Source ' + s['source'] + ' failed: ' + s['error']) for s in bad]; sys.exit(1 if bad else 0)" \
+          python -c "import json,sys; src=json.load(open('out/advisories.json'))['sources']; [print('::warning::The Fortinet PSIRT cross-check failed: ' + s['error']) for s in src if s.get('kind') == 'psirt-rss' and s.get('error')]; bad=[s for s in src if s.get('error') and s.get('kind') != 'psirt-rss']; [print('::error::Source ' + s['source'] + ' failed: ' + s['error']) for s in bad]; sys.exit(1 if bad else 0)" \
             || { echo "::error::A source failed: not publishing (the last complete bundle stays in use)"; exit 1; }
           python -c "import json,sys; b=json.load(open('out/advisories.json')); sys.exit(0 if len(b['advisories']) > 0 else 1)" \
             || { echo "::error::The bundle is empty: not publishing"; exit 1; }
